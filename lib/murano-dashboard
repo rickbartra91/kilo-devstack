@@ -1,0 +1,158 @@
+# lib/murano-dashboard
+
+# Dependencies:
+#
+# - ``functions`` file
+# - ``DEST``, ``DATA_DIR``, ``STACK_USER`` must be defined
+# - ``SERVICE_HOST``
+
+# ``stack.sh`` calls the entry points in this order:
+#
+# - install_murano_dashboard
+# - configure_murano_dashboard
+# - cleanup_murano_dashboard
+
+# Save trace setting
+XTRACE=$(set +o | grep xtrace)
+set -o xtrace
+
+source $TOP_DIR/lib/horizon
+
+
+
+# Defaults
+# --------
+
+HORIZON_CONFIG=${HORIZON_CONFIG:-$HORIZON_DIR/openstack_dashboard/settings.py}
+HORIZON_LOCAL_CONFIG=${HORIZON_LOCAL_CONFIG:-$HORIZON_DIR/openstack_dashboard/local/local_settings.py}
+
+# Set up default repos
+MURANO_DASHBOARD_REPO=${MURANO_DASHBOARD_REPO:-${GIT_BASE}/openstack/murano-dashboard.git}
+MURANO_DASHBOARD_BRANCH=${MURANO_DASHBOARD_BRANCH:-stable/kilo}
+
+# Set up default directories
+MURANO_DASHBOARD_DIR=$DEST/murano-dashboard
+MURANO_PYTHONCLIENT_DIR=$DEST/python-muranoclient
+
+MURANO_DASHBOARD_CACHE_DIR=${MURANO_DASHBOARD_CACHE_DIR:-/tmp/murano}
+
+# Functions
+# ---------
+
+function insert_config_block() {
+    local target_file="$1"
+    local insert_file="$2"
+    local pattern="$3"
+
+    if [[ -z "$pattern" ]]; then
+        cat "$insert_file" >> "$target_file"
+    else
+        sed -ne "/$pattern/r  $insert_file" -e 1x  -e '2,${x;p}' -e '${x;p}' -i "$target_file"
+    fi
+}
+
+
+function remove_config_block() {
+    local config_file="$1"
+    local label="$2"
+
+    if [[ -f "$config_file" ]] && [[ -n "$label" ]]; then
+        sed -e "/^#${label}_BEGIN/,/^#${label}_END/ d" -i "$config_file"
+    fi
+}
+
+
+# Entry points
+# ------------
+
+# configure_murano_dashboard() - Set config files, create data dirs, etc
+function configure_murano_dashboard() {
+    remove_config_block "$HORIZON_CONFIG" "MURANO_CONFIG_SECTION"
+
+    configure_settings_py
+    configure_local_settings_py
+
+    restart_apache_server
+}
+
+
+function configure_settings_py() {
+    local horizon_config_part=$(mktemp)
+
+    mkdir_chown_stack "$MURANO_DASHBOARD_CACHE_DIR"
+
+    # Write changes for dashboard config to a separate file
+    cat << EOF >> "$horizon_config_part"
+
+#MURANO_CONFIG_SECTION_BEGIN
+#-------------------------------------------------------------------------------
+METADATA_CACHE_DIR = '$MURANO_DASHBOARD_CACHE_DIR'
+DATABASES = {
+    'default': {
+        'ENGINE': 'django.db.backends.sqlite3',
+        'NAME': os.path.join(METADATA_CACHE_DIR, 'openstack-dashboard.sqlite')
+    }
+}
+SESSION_ENGINE = 'django.contrib.sessions.backends.db'
+MIDDLEWARE_CLASSES += ('muranodashboard.middleware.ExceptionMiddleware',)
+#-------------------------------------------------------------------------------
+#MURANO_CONFIG_SECTION_END
+
+EOF
+
+    # Insert changes into dashboard config before the line matching the pattern
+    insert_config_block "$HORIZON_CONFIG" "$horizon_config_part" "from openstack_dashboard import policy"
+
+    # Install Murano as plugin for Horizon
+    ln -s $MURANO_DASHBOARD_DIR/muranodashboard/local/_50_murano.py $HORIZON_DIR/openstack_dashboard/local/enabled/
+}
+
+
+function configure_local_settings_py() {
+    if [[ -f "$HORIZON_LOCAL_CONFIG" ]]; then
+        sed -e "s/\(^\s*OPENSTACK_HOST\s*=\).*$/\1 '$HOST_IP'/" -i "$HORIZON_LOCAL_CONFIG"
+    fi
+}
+
+
+# init_murano_dashboard() - Initialize databases, etc.
+function init_murano_dashboard() {
+    # clean up from previous (possibly aborted) runs
+    # create required data files
+
+    local horizon_manage_py="$HORIZON_DIR/manage.py"
+
+    python "$horizon_manage_py" collectstatic --noinput
+    python "$horizon_manage_py" syncdb --noinput
+
+    restart_apache_server
+}
+
+
+# install_murano_dashboard() - Collect source and prepare
+function install_murano_dashboard() {
+    echo_summary "Install Murano Dashboard"
+
+    git_clone $MURANO_DASHBOARD_REPO $MURANO_DASHBOARD_DIR $MURANO_DASHBOARD_BRANCH
+    # TODO(dteselkin): use setup_develop once Murano requirements match with global-requirement.txt
+    # both functions (setup_develop and setup_package) are defined at:
+    # http://git.openstack.org/cgit/openstack-dev/devstack/tree/functions-common
+    setup_package $MURANO_DASHBOARD_DIR -e
+}
+
+
+# cleanup_murano_dashboard() - Remove residual data files, anything left over from previous
+# runs that a clean run would need to clean up
+function cleanup_murano_dashboard() {
+    echo_summary "Cleanup Murano Dashboard"
+    remove_config_block "$HORIZON_CONFIG" "MURANO_CONFIG_SECTION"
+    rm $HORIZON_DIR/openstack_dashboard/local/enabled/_50_murano.py
+}
+
+
+# Restore xtrace
+$XTRACE
+
+# Local variables:
+# mode: shell-script
+# End:

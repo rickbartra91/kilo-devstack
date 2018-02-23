@@ -992,7 +992,7 @@ start_dstat
 
 # Keystone
 # --------
-
+pip_install "oslo.log<1.1.0,>=1.0.0"
 if is_service_enabled keystone; then
     echo_summary "Starting Keystone"
 
